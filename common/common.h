@@ -480,6 +480,9 @@ struct common_params {
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
+    // GPU-pill UMA KV writeback: -1 = auto (UMA only), 0 = disabled, 1 = enabled
+    int32_t gpu_pill = -1;
+
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
 
@@ -581,6 +584,16 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+
+    // Guanaco disk-streaming for MoE experts: keep only a small set of hot
+    // experts resident in RAM and stream the rest from NVMe on demand.
+    // Enable by selecting `--load-mode streaming`.
+    int32_t guanaco_max_experts  = -1;    // max hot experts pinned per tensor (-1 = auto)
+    bool   guanaco_io_uring      = true;  // use io_uring for async disk reads
+    bool   guanaco_pilot         = true;  // cross-layer lookahead prefetch
+    float  guanaco_pilot_mass    = 0.9f;  // pilot prefetch pruning mass fraction
+    bool   guanaco_imatrix       = true;  // seed hot pins from <model>.imatrix.gguf
+    std::string guanaco_affinity = "";    // expert-affinity warmup prompt (empty = disabled)
 
     bool single_turn       = false; // single turn chat conversation
 

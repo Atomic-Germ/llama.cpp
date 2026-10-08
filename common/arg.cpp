@@ -396,6 +396,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
     opts.download_dspark = spec_type_draft_dspark;
     opts.download_mmproj = use_mmproj && !params.no_mmproj
                         && params.mmproj.path.empty() && params.mmproj.url.empty();
+    opts.download_imatrix = params.load_mode == LLAMA_LOAD_MODE_STREAMING && params.guanaco_imatrix;
 
     if (!params.model.hf_repo.empty()) {
         plan = common_download_get_hf_plan(params.model, opts);
@@ -672,6 +673,11 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             } else {
                 hf_cache::finalize_file(plan.dspark);
             }
+        });
+    }
+    if (!plan.imatrix.local_path.empty()) {
+        tasks.emplace_back(plan.imatrix, opts, [&]() {
+            hf_cache::finalize_file(plan.imatrix);
         });
     }
     if (!plan.preset.local_path.empty()) {
@@ -2408,6 +2414,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_GRP_ATTN_W").set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
+        {"--gpu-pill"},
+        {"--no-gpu-pill"},
+        string_format("whether to enable GPU-pill UMA KV writeback (default: %s)",
+                      params.gpu_pill < 0 ? "auto" : (params.gpu_pill ? "enabled" : "disabled")),
+        [](common_params & params, bool value) {
+            params.gpu_pill = value ? 1 : 0;
+        }
+    ).set_env("LLAMA_GPU_PILL"));
+    add_opt(common_arg(
         {"-kvo", "--kv-offload"},
         {"-nkvo", "--no-kv-offload"},
         string_format("whether to enable KV cache offloading (default: %s)", params.no_kv_offload ? "disabled" : "enabled"),
@@ -2684,6 +2699,57 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_RPC"));
     }
     add_opt(common_arg(
+        {"-gs", "--guanaco-streaming"},
+        {"-ngs", "--no-guanaco-streaming"},
+        "deprecated alias for --load-mode streaming",
+        [](common_params & params, bool value) {
+            LOG_WRN("DEPRECATED: use --load-mode streaming instead\n");
+            params.load_mode = value ? LLAMA_LOAD_MODE_STREAMING : LLAMA_LOAD_MODE_MMAP;
+        }
+    ).set_env("LLAMA_ARG_GUANACO_STREAMING"));
+    add_opt(common_arg(
+        {"-gm", "--guanaco-max-experts"}, "N",
+        string_format("maximum hot experts per fused tensor (-1 = auto, default: %d)", params.guanaco_max_experts),
+        [](common_params & params, int value) {
+            params.guanaco_max_experts = value;
+        }
+    ).set_env("LLAMA_ARG_GUANACO_MAX_EXPERTS"));
+    add_opt(common_arg(
+        {"-gi", "--guanaco-io-uring"},
+        {"-ngi", "--no-guanaco-io-uring"},
+        string_format("use io_uring for Guanaco reads (default: %s)", params.guanaco_io_uring ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.guanaco_io_uring = value;
+        }
+    ).set_env("LLAMA_ARG_GUANACO_IO_URING"));
+    add_opt(common_arg(
+        {"-gp", "--guanaco-pilot"},
+        {"-ngp", "--no-guanaco-pilot"},
+        string_format("use cross-layer lookahead prefetch (default: %s)", params.guanaco_pilot ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.guanaco_pilot = value;
+        }
+    ).set_env("LLAMA_ARG_GUANACO_PILOT"));
+    add_opt(common_arg(
+        {"-gpm", "--guanaco-pilot-mass"}, "F",
+        string_format("pilot prefetch cumulative mass in (0, 1] (default: %.2f)", (double) params.guanaco_pilot_mass),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v <= 0.0f || v > 1.0f) {
+                throw std::invalid_argument("must be in (0, 1]");
+            }
+            params.guanaco_pilot_mass = v;
+        }
+    ).set_env("LLAMA_ARG_GUANACO_PILOT_MASS"));
+    add_opt(common_arg(
+        {"-gx", "--guanaco-imatrix"},
+        {"-ngx", "--no-guanaco-imatrix"},
+        string_format("seed hot experts from a sibling imatrix (default: %s)", params.guanaco_imatrix ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.guanaco_imatrix = value;
+        }
+    ).set_env("LLAMA_ARG_GUANACO_IMATRIX"));
+    add_opt(common_arg(
         {"-lm", "--load-mode"}, "MODE",
         "model loading mode (default: auto)\n"
         "- auto: mmap, unless a device does not support it\n"
@@ -2691,7 +2757,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
         "- mlock: force system to keep model in RAM rather than swapping or compressing\n"
         "- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
-        "- dio: use DirectIO if available\n",
+        "- dio: use DirectIO if available\n"
+        "- streaming: mmap + stream MoE experts from disk on demand (Guanaco)\n"
+        "- streaming: use Guanaco streaming loader when available\n",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "auto")       { params.load_mode = LLAMA_LOAD_MODE_AUTO;       }
             else if (value == "none")       { params.load_mode = LLAMA_LOAD_MODE_NONE;       }
@@ -2699,6 +2767,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
             else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
             else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
+            else if (value == "streaming")  { params.load_mode = LLAMA_LOAD_MODE_STREAMING;  }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
